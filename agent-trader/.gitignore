@@ -1,0 +1,48 @@
+# Agent_Trader .gitignore
+
+# ── Database — never push (large binary, local only) ──────────────────────────
+data/market.db
+data/*.db
+data/*.db-shm
+data/*.db-wal
+
+# ── Log files (local only) ────────────────────────────────────────────────────
+data/harvest.log
+data/cron.log
+data/pa_pull.log
+
+# ── Secrets ───────────────────────────────────────────────────────────────────
+.env
+*.env
+
+# ── Python cache ──────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+
+# ── macOS ─────────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+
+# ── IDEs ──────────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DATA FILES THAT ARE TRACKED (pushed to GitHub for PythonAnywhere to read)
+# Do NOT add these to .gitignore:
+#   data/results.json
+#   data/snapshot.json
+#   data/metadata.json
+#   data/rss_news.json
+# ─────────────────────────────────────────────────────────────────────────────
