@@ -1,2 +1,0 @@
-# vittasastra
-Story of Investment
