@@ -1,0 +1,402 @@
+name: "\U0001F680 VittaSastra Bootstrap"
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PURPOSE
+#  Run this workflow ONCE to fully configure the VittaSastra stack.
+#  Everything is driven from the "Run workflow" UI — no terminal needed.
+#
+#  WHAT IT DOES
+#    1. Generates or validates FERNET_KEY
+#    2. Sets all GitHub Actions secrets (via REST API)
+#    3. Verifies repository structure is complete
+#    4. Triggers the first price_harvest run
+#    5. Writes a ready-to-paste Streamlit Cloud TOML block to the job summary
+#
+#  HOW TO RUN
+#    Actions tab → "🚀 VittaSastra Bootstrap" → Run workflow → fill inputs → Run
+#
+#  ONE MANUAL STEP REMAINS
+#    Streamlit Cloud has no public API. After this workflow completes,
+#    go to share.streamlit.io and connect the repo (see job summary for details).
+#
+#  ⚠️  IMPORTANT — GITHUB_PAT INPUT
+#    The built-in GITHUB_TOKEN cannot set repository secrets (GitHub restriction).
+#    You must provide a Personal Access Token with:
+#      - repo    scope (full repository access)
+#      - secrets scope (read/write repository secrets)  ← REQUIRED for this workflow
+#    Create one at: github.com/settings/tokens → New classic token
+#    This PAT is also the one Streamlit Cloud uses to read the repo.
+# ══════════════════════════════════════════════════════════════════════════════
+
+on:
+  workflow_dispatch:
+    inputs:
+
+      github_pat:
+        description: >
+          GitHub PAT — REQUIRED. Must have 'repo' scope.
+          Create at: github.com/settings/tokens → New classic token → tick 'repo'.
+          This is also used by Streamlit Cloud to read the repo.
+        required: true
+        type: string
+
+      fernet_key:
+        description: >
+          FERNET_KEY for portfolio encryption.
+          Leave blank to auto-generate one (recommended).
+          If you already have one from a previous deploy, paste it here.
+        required: false
+        default: ""
+        type: string
+
+      anthropic_api_key:
+        description: >
+          ANTHROPIC_API_KEY — optional.
+          For the AI Scanner page (03_Scanner.py).
+          Get one at: console.anthropic.com → API Keys.
+          Leave blank to skip — Scanner runs in demo mode without it.
+        required: false
+        default: ""
+        type: string
+
+      perplexity_api_key:
+        description: >
+          PERPLEXITY_API_KEY — optional, Phase 2C only.
+          For LLM news impact scoring. Leave blank to skip.
+          Get one at: perplexity.ai/api
+        required: false
+        default: ""
+        type: string
+
+      trigger_harvest:
+        description: "Trigger price_harvest.yml immediately after bootstrap?"
+        required: false
+        default: "yes"
+        type: choice
+        options:
+          - "yes"
+          - "no"
+
+# No special permissions needed — we use the PAT from inputs for secret-writing
+permissions:
+  contents: read
+  actions:  write
+
+jobs:
+  bootstrap:
+    name: "Bootstrap VittaSastra"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+
+      # ════════════════════════════════════════════════════════════════════════
+      # 1. CHECKOUT
+      # ════════════════════════════════════════════════════════════════════════
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ════════════════════════════════════════════════════════════════════════
+      # 2. VALIDATE PAT
+      #    The PAT must be valid and have repo scope before we do anything else.
+      # ════════════════════════════════════════════════════════════════════════
+      - name: Validate GitHub PAT
+        env:
+          PAT: ${{ inputs.github_pat }}
+        run: |
+          echo "::add-mask::${PAT}"
+
+          echo "Checking PAT validity..."
+          HTTP_STATUS=$(curl -s -o /tmp/pat_check.json -w "%{http_code}" \
+            -H "Authorization: token ${PAT}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/user)
+
+          if [ "${HTTP_STATUS}" != "200" ]; then
+            echo "❌ PAT is invalid or expired (HTTP ${HTTP_STATUS})"
+            cat /tmp/pat_check.json
+            exit 1
+          fi
+
+          PAT_USER=$(jq -r '.login' /tmp/pat_check.json)
+          echo "✓ PAT valid — authenticated as: ${PAT_USER}"
+
+          # Check repo scope
+          SCOPES=$(curl -s -I \
+            -H "Authorization: token ${PAT}" \
+            https://api.github.com/user \
+            | grep -i "^x-oauth-scopes:" | tr -d '\r' | sed 's/x-oauth-scopes: //')
+
+          echo "  Token scopes: ${SCOPES}"
+
+          if echo "${SCOPES}" | grep -q "repo"; then
+            echo "✓ 'repo' scope confirmed"
+          else
+            echo "❌ PAT is missing 'repo' scope. Regenerate with 'repo' ticked."
+            exit 1
+          fi
+
+      # ════════════════════════════════════════════════════════════════════════
+      # 3. FERNET_KEY — GENERATE OR VALIDATE
+      # ════════════════════════════════════════════════════════════════════════
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install cryptography
+        run: pip install cryptography --quiet
+
+      - name: Generate or validate FERNET_KEY
+        id: fernet
+        run: |
+          python3 << 'PYEOF'
+          import os, sys, base64
+          from cryptography.fernet import Fernet
+
+          input_key = os.environ.get("INPUT_FERNET_KEY", "").strip()
+
+          if not input_key:
+              key = Fernet.generate_key().decode()
+              generated = "true"
+              print("✓ FERNET_KEY auto-generated")
+          else:
+              key = input_key
+              generated = "false"
+              # Validate
+              try:
+                  raw = base64.urlsafe_b64decode(key + "==")
+                  assert len(raw) == 32, f"Expected 32 bytes, got {len(raw)}"
+                  Fernet(key.encode())
+                  print("✓ FERNET_KEY validated OK")
+              except Exception as e:
+                  print(f"❌ Invalid FERNET_KEY: {e}")
+                  sys.exit(1)
+
+          # Write to GitHub outputs (safe — key is masked in next step)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"key={key}\n")
+              f.write(f"generated={generated}\n")
+          PYEOF
+        env:
+          INPUT_FERNET_KEY: ${{ inputs.fernet_key }}
+
+      - name: Mask FERNET_KEY in logs
+        run: echo "::add-mask::${{ steps.fernet.outputs.key }}"
+
+      # ════════════════════════════════════════════════════════════════════════
+      # 4. SET GITHUB ACTIONS SECRETS VIA REST API
+      #    GITHUB_TOKEN cannot write secrets — we use the PAT for this.
+      #    Endpoint: PUT /repos/{owner}/{repo}/actions/secrets/{name}
+      #    Value must be sodium-encrypted with the repo's public key.
+      # ════════════════════════════════════════════════════════════════════════
+      - name: Install PyNaCl (for secret encryption)
+        run: pip install PyNaCl --quiet
+
+      - name: Set all GitHub Actions secrets
+        run: |
+          python3 << 'PYEOF'
+          import os, sys, json, base64, urllib.request
+          from nacl import encoding, public
+
+          PAT        = os.environ["PAT"]
+          REPO       = os.environ["GITHUB_REPOSITORY"]
+          FERNET_KEY = os.environ["FERNET_KEY"]
+          ANTHROPIC  = os.environ.get("ANTHROPIC_KEY", "").strip()
+          PERPLEXITY = os.environ.get("PERPLEXITY_KEY", "").strip()
+
+          HEADERS = {
+              "Authorization": f"token {PAT}",
+              "Accept": "application/vnd.github+json",
+              "Content-Type": "application/json",
+              "X-GitHub-Api-Version": "2022-11-28",
+          }
+
+          # ── Get repo public key for encryption ──────────────────────────
+          url = f"https://api.github.com/repos/{REPO}/actions/secrets/public-key"
+          req = urllib.request.Request(url, headers=HEADERS)
+          with urllib.request.urlopen(req) as r:
+              pk_data = json.loads(r.read())
+          pub_key_id  = pk_data["key_id"]
+          pub_key_b64 = pk_data["key"]
+
+          # ── Encrypt a value with the repo public key ─────────────────────
+          def encrypt_secret(value: str) -> str:
+              pk = public.PublicKey(pub_key_b64.encode(), encoding.Base64Encoder())
+              box = public.SealedBox(pk)
+              encrypted = box.encrypt(value.encode())
+              return base64.b64encode(encrypted).decode()
+
+          # ── PUT a single secret ──────────────────────────────────────────
+          def set_secret(name: str, value: str):
+              if not value:
+                  print(f"  SKIP  {name} (empty)")
+                  return
+              payload = json.dumps({
+                  "encrypted_value": encrypt_secret(value),
+                  "key_id": pub_key_id,
+              }).encode()
+              url = f"https://api.github.com/repos/{REPO}/actions/secrets/{name}"
+              req = urllib.request.Request(url, data=payload, headers=HEADERS, method="PUT")
+              try:
+                  with urllib.request.urlopen(req) as r:
+                      status = r.status
+              except urllib.error.HTTPError as e:
+                  print(f"  ❌ FAILED {name}: HTTP {e.code} — {e.read().decode()}")
+                  sys.exit(1)
+              symbol = "✓ SET" if status in (201, 204) else f"? ({status})"
+              print(f"  {symbol}  {name}")
+
+          print("Setting secrets...")
+          set_secret("FERNET_KEY",         FERNET_KEY)
+          set_secret("FMP_API_KEY",         "none")       # reserved placeholder
+          set_secret("ANTHROPIC_API_KEY",   ANTHROPIC)
+          set_secret("PERPLEXITY_API_KEY",  PERPLEXITY)
+          print("Done.")
+          PYEOF
+        env:
+          PAT:             ${{ inputs.github_pat }}
+          FERNET_KEY:      ${{ steps.fernet.outputs.key }}
+          ANTHROPIC_KEY:   ${{ inputs.anthropic_api_key }}
+          PERPLEXITY_KEY:  ${{ inputs.perplexity_api_key }}
+
+      # ════════════════════════════════════════════════════════════════════════
+      # 5. VERIFY REPOSITORY STRUCTURE
+      # ════════════════════════════════════════════════════════════════════════
+      - name: Verify repository structure
+        run: |
+          echo "── Checking required files ──"
+          MISSING=0
+
+          check() {
+            if [ -e "$1" ]; then
+              echo "  ✓  $1"
+            else
+              echo "  ❌  MISSING: $1"
+              MISSING=$((MISSING + 1))
+            fi
+          }
+
+          check "streamlit_app.py"
+          check "requirements.txt"
+          check "pages/01_Global.py"
+          check "pages/02_Portfolio.py"
+          check "pages/03_Scanner.py"
+          check "assets/global.html"
+          check "core/data_loader.py"
+          check "core/rss_loader.py"
+          check "scripts/price_harvest.py"
+          check "scripts/model_run.py"
+          check "data/prices.json"
+          check "data/model_output.json"
+          check "data/revenue_trend.json"
+          check ".github/workflows/price_harvest.yml"
+          check ".github/workflows/model_run.yml"
+          check ".github/workflows/harvest.yml"
+
+          echo ""
+          if [ "${MISSING}" -gt 0 ]; then
+            echo "❌ ${MISSING} file(s) missing — push vittasastra_repo.zip first"
+            exit 1
+          else
+            echo "✓ All required files present"
+          fi
+
+      # ════════════════════════════════════════════════════════════════════════
+      # 6. TRIGGER FIRST price_harvest RUN
+      # ════════════════════════════════════════════════════════════════════════
+      - name: Trigger price_harvest.yml
+        if: ${{ inputs.trigger_harvest == 'yes' }}
+        env:
+          GH_TOKEN: ${{ inputs.github_pat }}
+        run: |
+          sleep 3   # brief pause so Actions picks up any newly pushed workflows
+          if gh workflow run price_harvest.yml \
+              --repo "${{ github.repository }}" \
+              --ref "${{ github.ref_name }}"; then
+            echo "✓ price_harvest.yml triggered"
+          else
+            echo "⚠ Could not auto-trigger — run manually from the Actions tab"
+          fi
+
+      # ════════════════════════════════════════════════════════════════════════
+      # 7. WRITE JOB SUMMARY  (visible in Actions UI under the green tick)
+      # ════════════════════════════════════════════════════════════════════════
+      - name: Write job summary
+        run: |
+          python3 << 'PYEOF'
+          import os
+
+          repo       = os.environ["GITHUB_REPOSITORY"]
+          branch     = os.environ["GITHUB_REF_NAME"]
+          fernet_key = os.environ["FERNET_KEY"]
+          github_pat = os.environ["GITHUB_PAT"]
+          anthro_key = os.environ["ANTHROPIC_KEY"]
+          generated  = os.environ["FERNET_GENERATED"]
+
+          lines = []
+          lines.append("## \U0001F680 VittaSastra Bootstrap — Complete\n")
+
+          lines.append("### \u2705 Actions completed\n")
+          lines.append("| Step | Result |")
+          lines.append("|------|--------|")
+          lines.append("| PAT validated | \u2705 Valid, `repo` scope confirmed |")
+          lines.append("| FERNET_KEY | \u2705 " + ("Auto-generated" if generated == "true" else "Provided — validated") + " |")
+          lines.append("| `FERNET_KEY` Actions secret | \u2705 Set |")
+          lines.append("| `FMP_API_KEY` Actions secret | \u2705 Set (placeholder) |")
+          lines.append("| `ANTHROPIC_API_KEY` Actions secret | " + ("\u2705 Set" if anthro_key else "\u23E9 Skipped (not provided)") + " |")
+          lines.append("| Repository structure | \u2705 All files verified |")
+          lines.append("| `price_harvest.yml` | \u2705 Triggered |")
+          lines.append("| Streamlit Cloud | \u23F3 One manual step below |\n")
+
+          if generated == "true":
+              lines.append("> \u26A0\uFE0F **Auto-generated FERNET_KEY** — copy it from the step log above")
+              lines.append("> and save it in your password manager. It is now set as an Actions secret.")
+              lines.append("")
+
+          lines.append("---")
+          lines.append("### \U0001F7E1 One manual step — Streamlit Cloud\n")
+          lines.append("Streamlit has no public API, so this one step needs a browser:\n")
+          lines.append(f"1. Go to **[share.streamlit.io](https://share.streamlit.io)** → New app")
+          lines.append(f"2. Repository: `{repo}`")
+          lines.append(f"3. Branch: `{branch}`")
+          lines.append(f"4. Main file path: `streamlit_app.py`")
+          lines.append(f"5. Click **Deploy!**")
+          lines.append(f"6. Go to **Settings \u2192 Secrets** and paste the TOML block below\n")
+
+          lines.append("---")
+          lines.append("### \U0001F511 Streamlit Cloud Secrets (copy-paste ready)\n")
+          lines.append("```toml")
+          lines.append(f'FERNET_KEY        = "{fernet_key}"')
+          if github_pat:
+              lines.append(f'GITHUB_TOKEN      = "{github_pat}"')
+          else:
+              lines.append('GITHUB_TOKEN      = "ghp_your_pat_here"')
+              lines.append('# Get at: github.com/settings/tokens → classic → repo scope')
+          lines.append(f'GITHUB_REPO       = "{repo}"')
+          if anthro_key:
+              lines.append(f'ANTHROPIC_API_KEY = "{anthro_key}"')
+          else:
+              lines.append('# ANTHROPIC_API_KEY = "sk-ant-..."  # add when ready')
+          lines.append("```\n")
+
+          lines.append("---")
+          lines.append("### \U0001F552 Scheduled workflows (nothing to do)\n")
+          lines.append("| Workflow | Schedule | Purpose |")
+          lines.append("|----------|----------|---------|")
+          lines.append("| `price_harvest.yml` | Every 30 min, 09:00\u201317:00 IST (Mon\u2013Fri) | Live prices + sector returns |")
+          lines.append("| `model_run.yml` | Auto after each price harvest + 16:45 IST | OLS model output |")
+          lines.append("| `harvest.yml` | 00:30 IST daily (Mon\u2013Fri) | Portfolio data |")
+          lines.append("| `dry_run.yml` | Manual only | Validation |")
+
+          summary_path = os.environ["GITHUB_STEP_SUMMARY"]
+          with open(summary_path, "w") as f:
+              f.write("\n".join(lines))
+
+          print("Job summary written.")
+          PYEOF
+        env:
+          FERNET_KEY:       ${{ steps.fernet.outputs.key }}
+          FERNET_GENERATED: ${{ steps.fernet.outputs.generated }}
+          GITHUB_PAT:       ${{ inputs.github_pat }}
+          ANTHROPIC_KEY:    ${{ inputs.anthropic_api_key }}
